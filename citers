@@ -1,0 +1,819 @@
+#!/usr/bin/env python3
+#       _ _
+#   ___(_) |_ ___ _ __ ___
+#  / __| | __/ _ \ '__/ __|
+# | (__| | ||  __/ |  \__ \
+#  \___|_|\__\___|_|  |___/
+#
+# F. P. Laussy -- https://github.com/laussy/citers
+# v1.0.0 Thu 15 Oct 2026 - first version: every work citing a DOI, from
+#                          OpenAlex, OpenCitations and Semantic Scholar,
+#                          merged, matched to BibTeX keys and compared with
+#                          the keys a text (or a MediaWiki page) already has.
+"""
+citers -- every work that cites a paper, from three open citation indexes,
+merged into one list and checked against your BibTeX files and your notes.
+
+Usage:
+    citers DOI [options]
+
+Sources (all free, no account needed):
+    OpenAlex           filter=cites:<work>
+    OpenCitations      index v2 (its arXiv-only and PubMed-only rows are named
+                       through the arXiv API and PubMed)
+    Semantic Scholar   citations, with the sentences that cite (--contexts)
+Preprints are joined to their published version through the doi arXiv records
+for them; works are also joined by DOI, PubMed id and normalised title.
+Crossref's own count of citing works is printed as a check on coverage.
+
+Options:
+    -b, --bib FILES       BibTeX file(s), comma-separated: citing works are
+                          given the key they have there (DOI, arXiv id, title)
+    -k, --known FILE      a text holding the keys already accounted for, e.g.
+                          a LaTeX file or wiki source ("-" = stdin). Keys are
+                          read from \\cite{..}, {{key}}, {{cite|a,b}} and the
+                          like; with --bib only real bib keys count
+    -w, --wiki-page TITLE read the known keys from a MediaWiki page instead
+        --wiki-api URL    that wiki's api.php (or env CITERS_WIKI_API)
+    -o, --own NAMES       surnames, comma-separated, marking self-citations
+                          ("Laussy,del Valle"); shown with a * and counted apart
+    -s, --since YEAR      only citing works from YEAR on
+    -m, --missing         only works not among the known keys (or, without
+                          --known, not in the bib files)
+    -f, --format FMT      text (default), csv, json, keys (bib keys, one per
+                          line), ids (DOI or arXiv:ID of works with no key --
+                          ready for a doi-to-bibtex tool)
+        --contexts        under each work, the sentences that cite (Semantic
+                          Scholar; often taken from the arXiv version)
+        --hunt QUERY      also look for citations the indexes failed to link:
+                          works matching QUERY in title/abstract (OpenAlex)
+                          are kept if their Crossref reference list cites the
+                          paper. Repeatable
+        --hunt-since YEAR start of the hunt (default: the paper's year)
+        --hunt-max N      candidates checked per query (default 300)
+        --mailto EMAIL    contact for the OpenAlex/Crossref polite pools
+                          (or env CITERS_MAILTO); nothing is sent without it
+        --s2-key KEY      Semantic Scholar API key (or env S2_API_KEY);
+                          without one, rate limits are met by waiting
+    -q, --quiet           no progress or summary on stderr
+    -V, --version         the version
+    -h, --help            this message
+
+Status column: K known, b in a bib file but not known, N new (no key).
+Sources column: A OpenAlex, C OpenCitations, S Semantic Scholar,
+X found by --hunt in a Crossref reference list.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from difflib import SequenceMatcher
+
+__version__ = '1.0.0'
+
+UA = 'citers/%s (+https://github.com/laussy/citers)' % __version__
+QUIET = False
+MAILTO = None
+
+
+def say(*a):
+    if not QUIET:
+        print(*a, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+_direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_default = urllib.request.build_opener()
+
+
+def get(url, params=None, headers=None, tries=5, wait=5, as_json=True):
+    """GET with retries on rate limits and server hiccups. A local host is
+    reached without the environment's proxy (a proxy set for the outside world
+    usually cannot see localhost)."""
+    if params:
+        url += ('&' if '?' in url else '?') + urllib.parse.urlencode(params)
+    host = urllib.parse.urlsplit(url).hostname or ''
+    opener = _direct if host in ('localhost', '127.0.0.1', '::1') else _default
+    ua = UA + (' mailto:%s' % MAILTO if MAILTO else '')
+    for attempt in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': ua, **(headers or {})})
+            with opener.open(req, timeout=90) as r:
+                data = r.read()
+            return json.loads(data) if as_json else data.decode('utf-8', 'replace')
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            if e.code in (429, 500, 502, 503, 504) and attempt < tries - 1:
+                time.sleep(wait)
+                wait = min(wait * 2, 60)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt < tries - 1:
+                time.sleep(wait)
+                wait = min(wait * 2, 60)
+                continue
+            raise
+
+
+# --------------------------------------------------------------------------
+# Normalisation
+# --------------------------------------------------------------------------
+def strip_accents(s):
+    return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+
+
+TEX_ACCENT = re.compile(r'\\[`\'^"~=.uvHtcdbk]\s*\{?\\?([a-zA-Z])\}?')
+
+
+def detex(s):
+    """TeX accents and braces off: {S\\'anchez Mu\\~noz} -> Sanchez Munoz."""
+    s = TEX_ACCENT.sub(r'\1', s or '')
+    s = re.sub(r'\\(ss|o|O|l|L|aa|AA|ae|AE|i)\b', lambda m: {'ss': 'ss', 'i': 'i'}.get(m.group(1), m.group(1)[0]), s)
+    return s.replace('{', '').replace('}', '').replace('~', ' ')
+
+
+def ntitle(t):
+    """A title reduced to lowercase letters and digits, markup removed."""
+    t = re.sub(r'<[^>]+>', '', t or '')          # HTML / MathML tags
+    t = re.sub(r'\$|\\[a-zA-Z]+', '', detex(t))   # TeX maths and commands
+    return re.sub(r'[^a-z0-9]', '', strip_accents(t).lower())
+
+
+def ndoi(d):
+    d = (d or '').strip().lower()
+    d = re.sub(r'^(https?://)?(dx\.)?doi\.org/', '', d)
+    d = re.sub(r'^doi:\s*', '', d)
+    return d.rstrip('.,;') or None
+
+
+def narxiv(a):
+    a = (a or '').strip()
+    a = re.sub(r'^(arxiv:|https?://arxiv\.org/abs/)', '', a, flags=re.I)
+    return re.sub(r'v\d+$', '', a) or None
+
+
+def arxiv_of_doi(d):
+    m = re.match(r'10\.48550/arxiv\.(.+)$', d or '')
+    return narxiv(m.group(1)) if m else None
+
+
+def surname(name):
+    m = re.search(r'\{([^{}]*\s[^{}]*)\}\s*$', name or '')   # BibTeX {Lopez Carreno}
+    if m:
+        return detex(m.group(1)).strip()
+    name = detex(name).strip()
+    if ',' in name:
+        return name.split(',')[0].strip()
+    parts = name.split()
+    return parts[-1] if parts else ''
+
+
+# --------------------------------------------------------------------------
+# Records and their merging
+# --------------------------------------------------------------------------
+class Rec:
+    def __init__(self, src=None):
+        self.src = {src} if src else set()   # no source: metadata lookup only
+        self.dois = set()
+        self.arxiv = set()
+        self.pmid = set()
+        self.title = None
+        self.authors = []
+        self.year = None
+        self.venue = None
+        self.type = None
+        self.contexts = []
+        self.published = False   # metadata comes from the journal, not a preprint
+
+    def ids(self):
+        out = ['doi:' + d for d in self.dois] + ['arxiv:' + a for a in self.arxiv] + ['pmid:' + p for p in self.pmid]
+        nt = ntitle(self.title)
+        if len(nt) >= 20:
+            out.append('title:' + nt)
+        return out
+
+
+def add_doi(rec, d):
+    d = ndoi(d)
+    if not d:
+        return
+    a = arxiv_of_doi(d)
+    if a:
+        rec.arxiv.add(a)
+    else:
+        rec.dois.add(d)
+
+
+def merge_all(recs):
+    """Union-find over shared identifiers; returns merged records."""
+    parent = list(range(len(recs)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    owner = {}
+    for i, r in enumerate(recs):
+        for k in r.ids():
+            if k in owner:
+                parent[find(i)] = find(owner[k])
+            else:
+                owner[k] = i
+    groups = {}
+    for i in range(len(recs)):
+        groups.setdefault(find(i), []).append(recs[i])
+    out = []
+    for members in groups.values():
+        # published metadata first, then the richest
+        members.sort(key=lambda r: (not r.published, not r.title, -len(r.authors)))
+        m = Rec()
+        for r in members:
+            m.src |= r.src
+            m.dois |= r.dois
+            m.arxiv |= r.arxiv
+            m.pmid |= r.pmid
+            m.contexts += [c for c in r.contexts if c not in m.contexts]
+            for f in ('title', 'year', 'venue', 'type'):
+                if getattr(m, f) is None and getattr(r, f):
+                    setattr(m, f, getattr(r, f))
+            if not m.authors and r.authors:
+                m.authors = r.authors
+            m.published = m.published or r.published
+        out.append(m)
+    return out
+
+
+def destamp(title):
+    """Drop the arXiv watermark a PDF parser can leave in front of a title,
+    spaced out into crumbs: "qu an tph ] 1 4 Se p 20 17 1 Nonlinear ...".
+    Only a run of four or more short crumbs, two of them with digits, is taken."""
+    toks = (title or '').split()
+    n = 0
+    while n < len(toks) and (len(toks[n]) <= 3 or re.search(r'[\d\]\[]', toks[n])):
+        n += 1
+    if n >= 4 and n < len(toks) and sum(bool(re.search(r'\d', t)) for t in toks[:n]) >= 2:
+        return ' '.join(toks[n:])
+    return title
+
+
+def similar(a, b):
+    """How alike two normalised titles are, 0..1. A long shared opening counts
+    as a match: index titles often carry junk in front (a PDF's arXiv stamp,
+    "N ov 2 01 8 ...") or lose their end."""
+    if not a or not b:
+        return 0.0
+    if min(len(a), len(b)) >= 50 and (a[:40] in b or b[:40] in a):
+        return 1.0
+    sm = SequenceMatcher(None, a, b, autojunk=False)
+    return sm.ratio() if sm.real_quick_ratio() > 0.8 and sm.quick_ratio() > 0.8 else 0.0
+
+
+def fuzzy_join(works, cut=0.9):
+    """Fold records with no identifier at all (Semantic Scholar has some, from
+    papers it parsed badly) into the work their title is closest to."""
+    anchored = [w for w in works if w.dois or w.arxiv or w.pmid]
+    keep = list(anchored)
+    for w in works:
+        if w in anchored:
+            continue
+        nt = ntitle(destamp(w.title))
+        best, score = None, 0.0
+        for a in anchored:
+            sc = similar(nt, ntitle(a.title))
+            if sc > score:
+                best, score = a, sc
+        if best is not None and score >= cut:
+            best.src |= w.src
+            best.contexts += [c for c in w.contexts if c not in best.contexts]
+        else:
+            keep.append(w)
+    return keep
+
+
+# --------------------------------------------------------------------------
+# Sources
+# --------------------------------------------------------------------------
+def crossref(doi):
+    p = {'mailto': MAILTO} if MAILTO else None
+    r = get('https://api.crossref.org/works/' + urllib.parse.quote(doi), p)
+    return r['message'] if r else None
+
+
+def from_crossref(m, src):
+    r = Rec(src)
+    add_doi(r, m.get('DOI'))
+    r.title = ' '.join(m.get('title') or []) or None
+    r.authors = [(a.get('given', '') + ' ' + a.get('family', '')).strip() or a.get('name', '')
+                 for a in m.get('author', [])]
+    dp = (m.get('issued') or m.get('published') or {}).get('date-parts') or [[None]]
+    r.year = dp[0][0]
+    r.venue = ' '.join(m.get('container-title') or []) or None
+    r.type = m.get('type')
+    r.published = m.get('type') != 'posted-content'
+    return r
+
+
+def openalex(doi):
+    p = {'mailto': MAILTO} if MAILTO else {}
+    w = get('https://api.openalex.org/works/doi:' + doi, dict(p, select='id,cited_by_count'))
+    if not w:
+        return [], None
+    wid = w['id'].rsplit('/', 1)[-1]
+    # page numbers, not cursors: without an API key OpenAlex answers a
+    # next-page cursor with 401 (2026); plain paging reaches 10,000 works
+    out, page = [], 1
+    sel = 'id,doi,title,publication_year,authorships,primary_location,type,ids'
+    while page:
+        d = get('https://api.openalex.org/works',
+                dict(p, filter='cites:' + wid, page=page, select=sel, **{'per-page': 200}))
+        for x in d['results']:
+            r = Rec('A')
+            add_doi(r, x.get('doi'))
+            ids = x.get('ids') or {}
+            if ids.get('pmid'):
+                r.pmid.add(ids['pmid'].rsplit('/', 1)[-1])
+            loc = x.get('primary_location') or {}
+            lp = loc.get('landing_page_url') or ''
+            if 'arxiv.org/abs/' in lp:
+                r.arxiv.add(narxiv(lp.split('/abs/')[-1]))
+            r.title = x.get('title')
+            r.authors = [a['author']['display_name'] for a in x.get('authorships', [])]
+            r.year = x.get('publication_year')
+            r.venue = (loc.get('source') or {}).get('display_name')
+            r.type = x.get('type')
+            r.published = r.type not in ('preprint',) and bool(r.dois)
+            out.append(r)
+        page = page + 1 if len(d['results']) == 200 and page < 50 else None
+    return out, wid
+
+
+def opencitations(doi):
+    d = get('https://api.opencitations.net/index/v2/citations/doi:' + doi) or []
+    out = []
+    for c in d:
+        r = Rec('C')
+        for tok in c.get('citing', '').split():
+            kind, _, val = tok.partition(':')
+            if kind == 'doi':
+                add_doi(r, val)
+            elif kind == 'arxiv':
+                r.arxiv.add(narxiv(val))
+            elif kind == 'pmid':
+                r.pmid.add(val)
+        if c.get('creation'):
+            r.year = int(c['creation'][:4])
+        out.append(r)
+    return out
+
+
+def semanticscholar(doi, key=None):
+    h = {'x-api-key': key} if key else None
+    out, offset = [], 0
+    while offset is not None:
+        d = get('https://api.semanticscholar.org/graph/v1/paper/DOI:%s/citations' % doi,
+                {'fields': 'contexts,title,year,externalIds,authors,venue',
+                 'limit': 1000, 'offset': offset}, headers=h, tries=7, wait=10)
+        if not d:
+            break
+        for c in d.get('data', []):
+            p = c['citingPaper']
+            e = p.get('externalIds') or {}
+            r = Rec('S')
+            add_doi(r, e.get('DOI'))
+            if e.get('ArXiv'):
+                r.arxiv.add(narxiv(e['ArXiv']))
+            if e.get('PubMed'):
+                r.pmid.add(str(e['PubMed']))
+            r.title = p.get('title')
+            r.authors = [a['name'] for a in p.get('authors', [])]
+            r.year = p.get('year')
+            r.venue = p.get('venue') or None
+            r.contexts = c.get('contexts') or []
+            out.append(r)
+        offset = d.get('next')
+    return out
+
+
+def arxiv_meta(ids):
+    """arXiv id -> Rec (title, authors, year, and the journal doi if any)."""
+    ns = {'a': 'http://www.w3.org/2005/Atom', 'x': 'http://arxiv.org/schemas/atom'}
+    out = {}
+    ids = sorted(set(ids))
+    for k in range(0, len(ids), 50):
+        if k:
+            time.sleep(3)   # arXiv asks for a pause between calls
+        xml = get('https://export.arxiv.org/api/query',
+                  {'id_list': ','.join(ids[k:k + 50]), 'max_results': 50}, as_json=False, tries=6, wait=10)
+        for e in ET.fromstring(xml).findall('a:entry', ns):
+            i = narxiv(e.find('a:id', ns).text.split('/abs/')[-1])
+            r = Rec()
+            r.arxiv.add(i)
+            r.title = ' '.join((e.find('a:title', ns).text or '').split())
+            r.authors = [a.find('a:name', ns).text for a in e.findall('a:author', ns)]
+            r.year = int(e.find('a:published', ns).text[:4])
+            d = e.find('x:doi', ns)
+            if d is not None:
+                add_doi(r, d.text)
+            out[i] = r
+    return out
+
+
+def pubmed_meta(pmids):
+    if not pmids:
+        return {}
+    d = get('https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi',
+            {'db': 'pubmed', 'id': ','.join(sorted(pmids)), 'retmode': 'json'})
+    out = {}
+    for p in sorted(pmids):
+        s = (d or {}).get('result', {}).get(p)
+        if not s:
+            continue
+        r = Rec()
+        r.pmid.add(p)
+        r.title = s.get('title')
+        r.authors = [a['name'] for a in s.get('authors', [])]
+        try:
+            r.year = int(s.get('pubdate', '')[:4])
+        except ValueError:
+            pass
+        for a in s.get('articleids', []):
+            if a.get('idtype') == 'doi':
+                add_doi(r, a['value'])
+        out[p] = r
+    return out
+
+
+def enrich(recs):
+    """Name what the indexes only give as identifiers, and tie preprints to
+    their journal version."""
+    # only preprint-only records need arXiv: the others are named already
+    ax = {a for r in recs if not r.dois for a in r.arxiv}
+    if ax:
+        say('  arXiv: %d preprint ids' % len(ax))
+        try:
+            recs += list(arxiv_meta(ax).values())
+        except urllib.error.HTTPError as e:
+            say('  arXiv API refused (%s): preprints stay unnamed and unjoined; try again later' % e.code)
+    bare = [r for r in recs if not r.title and r.dois]
+    for r in bare:
+        best = None
+        for d in sorted(r.dois):
+            m = crossref(d)
+            if m and (best is None or m.get('type') == 'journal-article'):
+                best = m
+        if best:
+            recs.append(from_crossref(best, None))
+    pm = {p for r in recs if not r.title and not r.dois for p in r.pmid}
+    recs += list(pubmed_meta(pm).values())
+    return recs
+
+
+# --------------------------------------------------------------------------
+# --hunt: citations no index has linked
+# --------------------------------------------------------------------------
+def target_meta(doi):
+    m = crossref(doi) or {}
+    au = m.get('author') or [{}]
+    dp = (m.get('issued') or {}).get('date-parts') or [[None]]
+    return {'doi': doi, 'nt': ntitle(' '.join(m.get('title') or [])),
+            'volume': str(m.get('volume') or ''), 'page': str(m.get('page') or '').split('-')[0],
+            'year': str(dp[0][0] or ''), 'surname': ntitle(au[0].get('family', '')),
+            'count': m.get('is-referenced-by-count'), 'title': ' '.join(m.get('title') or [])}
+
+
+def cites_target(ref, t):
+    if ndoi(ref.get('DOI')) == t['doi']:
+        return True
+    txt = ' '.join(str(ref.get(k, '')) for k in ('unstructured', 'article-title', 'journal-title', 'author'))
+    if len(t['nt']) >= 20 and t['nt'][:30] in ntitle(txt):
+        return True
+    if t['volume'] and t['page']:
+        if (str(ref.get('volume', '')) == t['volume'] and str(ref.get('first-page', '')) == t['page']
+                and str(ref.get('year', '')) == t['year']):
+            return True
+        u = ref.get('unstructured', '')
+        if (re.search(r'\b%s\b\D{1,8}\b%s\b' % (re.escape(t['volume']), re.escape(t['page'])), u)
+                and t['year'] in u and t['surname'] and t['surname'] in ntitle(u)):
+            return True
+    return False
+
+
+def hunt(query, since, cap, known_dois, t):
+    p = {'mailto': MAILTO} if MAILTO else {}
+    q = query.replace(',', ' ')
+    cands, page = [], 1
+    while page and len(cands) < cap:
+        d = get('https://api.openalex.org/works',
+                dict(p, filter='title_and_abstract.search:%s,from_publication_date:%s-01-01' % (q, since),
+                     page=page, select='doi', **{'per-page': 200}))
+        cands += [ndoi(x['doi']) for x in d['results'] if x.get('doi')]
+        page = page + 1 if len(d['results']) == 200 and page < 50 else None
+    cands = [c for c in dict.fromkeys(cands[:cap]) if c not in known_dois and not arxiv_of_doi(c)]
+    say('  hunt "%s": %d candidates not already listed' % (query, len(cands)))
+    found = []
+    for i, c in enumerate(cands, 1):
+        m = crossref(c)
+        if m and any(cites_target(ref, t) for ref in m.get('reference', [])):
+            r = from_crossref(m, 'X')
+            found.append(r)
+            say('    + %s %s' % (c, (r.title or '')[:70]))
+        if i % 50 == 0:
+            say('    %d/%d checked' % (i, len(cands)))
+    return found
+
+
+# --------------------------------------------------------------------------
+# BibTeX
+# --------------------------------------------------------------------------
+def bib_entries(text):
+    """(key, {field: value}) for every @entry, braces matched by hand (an entry
+    may close on its last field line)."""
+    for m in re.finditer(r'@(\w+)\s*\{\s*([^,\s]+)\s*,', text):
+        if m.group(1).lower() in ('string', 'comment', 'preamble'):
+            continue
+        i, depth = m.end(), 1
+        while i < len(text) and depth:
+            depth += {'{': 1, '}': -1}.get(text[i], 0)
+            i += 1
+        body, fields = text[m.end():i - 1], {}
+        for f in re.finditer(r'(\w+)\s*=\s*', body):
+            j = f.end()
+            if j < len(body) and body[j] in '{"':
+                close = '}' if body[j] == '{' else '"'
+                k, d = j + 1, 1
+                while k < len(body) and d:
+                    if body[k] == '{':
+                        d += 1
+                    elif body[k] == '}':
+                        d -= 1
+                    elif close == '"' and body[k] == '"' and d == 1:
+                        d = 0
+                        k += 1
+                        break
+                    k += 1
+                val = body[j + 1:k - 1]
+            else:
+                val = re.match(r'[^,\s}]*', body[j:]).group(0)
+            fields.setdefault(f.group(1).lower(), val)
+        yield m.group(2), fields
+
+
+class Bib:
+    def __init__(self, paths):
+        self.by = {}
+        self.authors = {}
+        self.keys = set()
+        self.titles = []    # (normalised title, key, year), for records with no id
+        for p in paths:
+            text = open(os.path.expanduser(p), encoding='utf-8', errors='replace').read()
+            for key, f in bib_entries(text):
+                self.keys.add(key)
+                self.authors[key] = f.get('author', '')
+                ids = []
+                for v in (f.get('doi'), f.get('url')):
+                    if v and ('10.' in v):
+                        d = ndoi(re.sub(r'^.*?(10\.\d{4,9}/)', r'\1', v))
+                        a = arxiv_of_doi(d)
+                        ids.append('arxiv:' + a if a else 'doi:' + d)
+                for v in (f.get('eprint'), f.get('journal'), f.get('url')):
+                    m = re.search(r'(?:arXiv:|arxiv\.org/abs/)\s*([\w.\-/]+\d)', v or '', re.I)
+                    if m:
+                        ids.append('arxiv:' + narxiv(m.group(1)))
+                nt = ntitle(f.get('title'))
+                if len(nt) >= 20:
+                    ids.append('title:' + nt)
+                    y = re.search(r'\d{4}', f.get('year', ''))
+                    self.titles.append((nt, key, int(y.group(0)) if y else None))
+                for i in ids:
+                    self.by.setdefault(i, [])
+                    if key not in self.by[i]:
+                        self.by[i].append(key)
+
+    def match(self, rec, since=None):
+        out = []
+        for i in rec.ids():
+            for k in self.by.get(i, []):
+                if k not in out:
+                    out.append(k)
+        if not out and not (rec.dois or rec.arxiv or rec.pmid):
+            nt = ntitle(destamp(rec.title))
+            # a work older than the cited paper cannot be citing it
+            best = max(((similar(nt, t), k) for t, k, y in self.titles if not (since and y and y < since)),
+                       default=(0, None))
+            if best[0] >= 0.9:
+                out.append(best[1])
+        return out
+
+
+# --------------------------------------------------------------------------
+# Known keys
+# --------------------------------------------------------------------------
+KEY = re.compile(r'(?<![\w/.])((?:arXiv_)?[A-Za-z]+\d{2}[a-z]{1,3})(?![\w])')
+
+
+def lcfirst(k):
+    return k if k.startswith('arXiv_') else k[:1].lower() + k[1:]
+
+
+def known_keys(text, bib):
+    toks = {lcfirst(t) for t in KEY.findall(text)}
+    if bib:
+        real = {lcfirst(k): k for k in bib.keys}
+        return {real[t] for t in toks if t in real}
+    return toks
+
+
+def wiki_text(api, title):
+    d = get(api, {'action': 'query', 'prop': 'revisions', 'rvprop': 'content', 'rvslots': 'main',
+                  'titles': title, 'format': 'json', 'formatversion': 2})
+    page = d['query']['pages'][0]
+    if page.get('missing'):
+        sys.exit('citers: no page "%s" on %s' % (title, api))
+    return page['revisions'][0]['slots']['main']['content']
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+def parse_args(argv):
+    o = {'bib': [], 'known': None, 'wiki_page': None, 'wiki_api': os.environ.get('CITERS_WIKI_API'),
+         'own': [], 'since': None, 'missing': False, 'format': 'text', 'contexts': False,
+         'hunt': [], 'hunt_since': None, 'hunt_max': 300, 'mailto': os.environ.get('CITERS_MAILTO'),
+         's2_key': os.environ.get('S2_API_KEY'), 'quiet': False, 'doi': None}
+    takes = {'-b': 'bib', '--bib': 'bib', '-k': 'known', '--known': 'known', '-w': 'wiki_page',
+             '--wiki-page': 'wiki_page', '--wiki-api': 'wiki_api', '-o': 'own', '--own': 'own',
+             '-s': 'since', '--since': 'since', '-f': 'format', '--format': 'format',
+             '--hunt': 'hunt', '--hunt-since': 'hunt_since', '--hunt-max': 'hunt_max',
+             '--mailto': 'mailto', '--s2-key': 's2_key'}
+    flags = {'-m': 'missing', '--missing': 'missing', '--contexts': 'contexts', '-q': 'quiet', '--quiet': 'quiet'}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('-h', '--help'):
+            print(__doc__.strip())
+            sys.exit(0)
+        if a in ('-V', '--version'):
+            print('citers', __version__)
+            sys.exit(0)
+        if '=' in a and a.split('=', 1)[0] in takes:
+            a, val = a.split('=', 1)
+            argv[i:i + 1] = [a, val]
+        if a in takes:
+            if i + 1 >= len(argv):
+                sys.exit('citers: %s needs a value' % a)
+            k, v = takes[a], argv[i + 1]
+            if k == 'bib':
+                o['bib'] += [x for x in v.split(',') if x]
+            elif k == 'own':
+                o['own'] += [x.strip() for x in v.split(',') if x.strip()]
+            elif k == 'hunt':
+                o['hunt'].append(v)
+            elif k in ('since', 'hunt_since', 'hunt_max'):
+                o[k] = int(v)
+            else:
+                o[k] = v
+            i += 2
+            continue
+        if a in flags:
+            o[flags[a]] = True
+        elif a.startswith('-') and a != '-':
+            sys.exit('citers: unknown option %s (citers -h)' % a)
+        elif o['doi'] is None:
+            o['doi'] = a
+        else:
+            sys.exit('citers: one DOI at a time')
+        i += 1
+    if not o['doi']:
+        print(__doc__.strip())
+        sys.exit(1)
+    if o['format'] not in ('text', 'csv', 'json', 'keys', 'ids'):
+        sys.exit('citers: --format is text, csv, json, keys or ids')
+    if o['wiki_page'] and not o['wiki_api']:
+        sys.exit('citers: --wiki-page needs --wiki-api (or env CITERS_WIKI_API)')
+    return o
+
+
+def main(argv):
+    global QUIET, MAILTO
+    o = parse_args(argv)
+    QUIET, MAILTO = o['quiet'], o['mailto']
+    doi = ndoi(o['doi'])
+
+    bib = Bib(o['bib']) if o['bib'] else None
+    known = None
+    if o['wiki_page']:
+        known = known_keys(wiki_text(o['wiki_api'], o['wiki_page']), bib)
+    elif o['known']:
+        txt = sys.stdin.read() if o['known'] == '-' else open(os.path.expanduser(o['known']), encoding='utf-8', errors='replace').read()
+        known = known_keys(txt, bib)
+
+    say('citers %s: works citing %s' % (__version__, doi))
+    oa, wid = openalex(doi)
+    say('  OpenAlex: %d%s' % (len(oa), '' if wid else ' (DOI unknown to OpenAlex)'))
+    oc = opencitations(doi)
+    say('  OpenCitations: %d' % len(oc))
+    s2 = semanticscholar(doi, o['s2_key'])
+    say('  Semantic Scholar: %d' % len(s2))
+    t = target_meta(doi)
+    recs = enrich(oa + oc + s2)
+    works = fuzzy_join(merge_all(recs))
+    # the paper itself can come back through a preprint alias; drop it
+    works = [w for w in works if doi not in w.dois]
+
+    if o['hunt']:
+        listed = {d for w in works for d in w.dois}
+        found = []
+        for q in o['hunt']:
+            found += hunt(q, o['hunt_since'] or t['year'] or 1900, o['hunt_max'], listed, t)
+            listed |= {d for r in found for d in r.dois}
+        works = merge_all([w for w in works] + found)
+
+    words = lambda s: ' %s ' % re.sub(r'[^a-z]+', ' ', strip_accents(detex(s)).lower()).strip()
+    own = [words(n) for n in o['own']]
+    for w in works:
+        w.keys = bib.match(w, int(t['year']) - 1 if t['year'] else None) if bib else []
+        if known is not None and any(k in known for k in w.keys):
+            w.status = 'K'
+            w.key = next(k for k in w.keys if k in known)
+        elif w.keys:
+            w.status = 'b'
+            w.key = sorted(w.keys, key=lambda k: k.startswith('arXiv_'))[0]
+        else:
+            w.status, w.key = 'N', None
+        names = [detex(a) for a in re.split(r'\s+and\s+', bib.authors.get(w.key, ''))] if (bib and w.key) else w.authors
+        w.own = any(n.strip() and n in words(a) for n in own for a in names)
+        w.first = surname(names[0]) if names else '?'
+
+    sel = works
+    if o['since']:
+        sel = [w for w in sel if (w.year or 0) >= o['since']]
+    if o['missing']:
+        sel = [w for w in sel if w.status != 'K'] if known is not None else [w for w in sel if w.status == 'N']
+    sel.sort(key=lambda w: (w.year or 0, (w.key or w.first or '').lower()))
+
+    def ident(w):
+        d = sorted(w.dois)
+        return d[0] if d else ('arXiv:' + sorted(w.arxiv)[0] if w.arxiv else '')
+
+    srcs = lambda w: ''.join(c for c in 'ACSX' if c in w.src)
+    f = o['format']
+    if f == 'text':
+        for w in sel:
+            print('%s%s %s  %-24s %-14s %-60s %s' % (w.status, '*' if w.own else ' ', w.year or '????',
+                  (w.key or ident(w))[:24], w.first[:14], (w.title or '')[:60], srcs(w)))
+            if o['contexts']:
+                for c in w.contexts:
+                    print('        > ' + ' '.join(c.split()))
+    elif f == 'csv':
+        import csv
+        cw = csv.writer(sys.stdout)
+        cw.writerow(['status', 'own', 'year', 'key', 'doi', 'arxiv', 'first_author', 'title', 'venue', 'sources'])
+        for w in sel:
+            cw.writerow([w.status, int(w.own), w.year or '', w.key or '', ' '.join(sorted(w.dois)),
+                         ' '.join(sorted(w.arxiv)), w.first, w.title or '', w.venue or '', srcs(w)])
+    elif f == 'json':
+        json.dump([{'status': w.status, 'own': w.own, 'year': w.year, 'key': w.key, 'keys': w.keys,
+                    'dois': sorted(w.dois), 'arxiv': sorted(w.arxiv), 'pmid': sorted(w.pmid),
+                    'title': w.title, 'authors': w.authors, 'venue': w.venue, 'type': w.type,
+                    'sources': srcs(w), 'contexts': w.contexts} for w in sel],
+                  sys.stdout, indent=1, ensure_ascii=False)
+        print()
+    elif f == 'keys':
+        for w in sel:
+            if w.key:
+                print(w.key)
+    elif f == 'ids':
+        for w in sel:
+            if w.status == 'N' and ident(w):
+                print(ident(w))
+
+    n = {s: sum(w.status == s for w in works) for s in 'KbN'}
+    say('%d citing works (Crossref counts %s published ones)%s' % (
+        len(works), t['count'] if t['count'] is not None else '?',
+        '; %d self-citations' % sum(w.own for w in works) if own else ''))
+    if bib and known is not None:
+        say('  %d known, %d in the bib files but not known, %d with no key' % (n['K'], n['b'], n['N']))
+    elif bib:
+        say('  %d in the bib files, %d with no key' % (n['b'], n['N']))
+
+
+if __name__ == '__main__':
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        pass
