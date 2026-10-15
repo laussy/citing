@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
-#       _ _
-#   ___(_) |_ ___ _ __ ___
-#  / __| | __/ _ \ '__/ __|
-# | (__| | ||  __/ |  \__ \
-#  \___|_|\__\___|_|  |___/
+#       _ _   _
+#   ___(_) |_(_)_ __   __ _
+#  / __| | __| | '_ \ / _` |
+# | (__| | |_| | | | | (_| |
+#  \___|_|\__|_|_| |_|\__, |
+#                     |___/
 #
-# F. P. Laussy -- https://github.com/laussy/citers
-# v1.0.0 Thu 15 Oct 2026 - first version: every work citing a DOI, from
-#                          OpenAlex, OpenCitations and Semantic Scholar,
-#                          merged, matched to BibTeX keys and compared with
-#                          the keys a text (or a MediaWiki page) already has.
+# F. P. Laussy -- https://github.com/laussy/citing
+# v1.0.0 Thu 15 Oct 2026 - first version (as "citers"): every work citing a
+#                          DOI, from OpenAlex, OpenCitations and Semantic
+#                          Scholar, merged, matched to BibTeX keys and compared
+#                          with the keys a text (or a MediaWiki page) already
+#                          has.
+# v2.0.0 Thu 15 Oct 2026 - renamed citing (env CITING_*); the paper can be a
+#                          BibTeX key of the --bib files, an arXiv id or an
+#                          OpenAlex id as well as a DOI (a key with no DOI is
+#                          found by title); defaults in ~/.citingrc; the
+#                          functions are importable (vip builds on them).
 """
-citers -- every work that cites a paper, from three open citation indexes,
+citing -- every work that cites a paper, from three open citation indexes,
 merged into one list and checked against your BibTeX files and your notes.
 
 Usage:
-    citers DOI [options]
+    citing PAPER [options]
+
+PAPER is a DOI, an arXiv id (arXiv:2604.24204, cond-mat/0601234), an OpenAlex
+id (W2067552737), or a key of the --bib files: its DOI is then read from the
+entry's doi or url field (url = {doi:...} works), its arXiv id from eprint,
+journal or url, and an entry with neither is looked up by title in OpenAlex.
 
 Sources (all free, no account needed):
     OpenAlex           filter=cites:<work>
@@ -34,7 +46,7 @@ Options:
                           read from \\cite{..}, {{key}}, {{cite|a,b}} and the
                           like; with --bib only real bib keys count
     -w, --wiki-page TITLE read the known keys from a MediaWiki page instead
-        --wiki-api URL    that wiki's api.php (or env CITERS_WIKI_API)
+        --wiki-api URL    that wiki's api.php (or env CITING_WIKI_API)
     -o, --own NAMES       surnames, comma-separated, marking self-citations
                           ("Laussy,del Valle"); shown with a * and counted apart
     -s, --since YEAR      only citing works from YEAR on
@@ -52,9 +64,11 @@ Options:
         --hunt-since YEAR start of the hunt (default: the paper's year)
         --hunt-max N      candidates checked per query (default 300)
         --mailto EMAIL    contact for the OpenAlex/Crossref polite pools
-                          (or env CITERS_MAILTO); nothing is sent without it
+                          (or env CITING_MAILTO); nothing is sent without it
         --s2-key KEY      Semantic Scholar API key (or env S2_API_KEY);
                           without one, rate limits are met by waiting
+        --openalex-key K  OpenAlex API key (or env OPENALEX_API_KEY); without
+                          one, OpenAlex allows a daily budget per address
     -q, --quiet           no progress or summary on stderr
     -V, --version         the version
     -h, --help            this message
@@ -62,6 +76,12 @@ Options:
 Status column: K known, b in a bib file but not known, N new (no key).
 Sources column: A OpenAlex, C OpenCitations, S Semantic Scholar,
 X found by --hunt in a Crossref reference list.
+
+Defaults: ~/.citingrc (or the file named by env CITING_RC) holds options, as
+on the command line, one or more per line; # starts a comment. An option
+given on the command line replaces the one from the file, e.g.
+    --bib ~/bib/refs.bib,~/bib/preprints.bib
+    --mailto me@example.org
 """
 
 import json
@@ -76,11 +96,14 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 
-__version__ = '1.0.0'
+__version__ = '2.0.0'
 
-UA = 'citers/%s (+https://github.com/laussy/citers)' % __version__
+UA = 'citing/%s (+https://github.com/laussy/citing)' % __version__
 QUIET = False
 MAILTO = None
+OPENALEX_KEY = None
+CALLS = {}          # host -> requests made
+BUDGET = {}         # host -> rate-limit headers of its last answer
 
 
 def say(*a):
@@ -99,16 +122,22 @@ def get(url, params=None, headers=None, tries=5, wait=5, as_json=True):
     """GET with retries on rate limits and server hiccups. A local host is
     reached without the environment's proxy (a proxy set for the outside world
     usually cannot see localhost)."""
+    host = urllib.parse.urlsplit(url).hostname or ''
+    if host == 'api.openalex.org' and OPENALEX_KEY:
+        params = dict(params or {}, api_key=OPENALEX_KEY)
     if params:
         url += ('&' if '?' in url else '?') + urllib.parse.urlencode(params)
-    host = urllib.parse.urlsplit(url).hostname or ''
     opener = _direct if host in ('localhost', '127.0.0.1', '::1') else _default
     ua = UA + (' mailto:%s' % MAILTO if MAILTO else '')
     for attempt in range(tries):
         try:
             req = urllib.request.Request(url, headers={'User-Agent': ua, **(headers or {})})
+            CALLS[host] = CALLS.get(host, 0) + 1
             with opener.open(req, timeout=90) as r:
                 data = r.read()
+                rl = {k.lower(): v for k, v in r.headers.items() if k.lower().startswith('x-ratelimit')}
+                if rl:
+                    BUDGET[host] = rl
             return json.loads(data) if as_json else data.decode('utf-8', 'replace')
         except urllib.error.HTTPError as e:
             if e.code == 404:
@@ -326,12 +355,35 @@ def from_crossref(m, src):
     return r
 
 
-def openalex(doi):
+def openalex_work(ident, select='id,doi,title,publication_year,cited_by_count,authorships'):
+    """One OpenAlex work, by W-id or 'doi:...'; None if OpenAlex has none."""
     p = {'mailto': MAILTO} if MAILTO else {}
-    w = get('https://api.openalex.org/works/doi:' + doi, dict(p, select='id,cited_by_count'))
-    if not w:
-        return [], None
-    wid = w['id'].rsplit('/', 1)[-1]
+    return get('https://api.openalex.org/works/' + urllib.parse.quote(ident, safe=':/'), dict(p, select=select))
+
+
+def oa_rec(x, src='A'):
+    """An OpenAlex work as a Rec."""
+    r = Rec(src)
+    add_doi(r, x.get('doi'))
+    ids = x.get('ids') or {}
+    if ids.get('pmid'):
+        r.pmid.add(ids['pmid'].rsplit('/', 1)[-1])
+    loc = x.get('primary_location') or {}
+    lp = loc.get('landing_page_url') or ''
+    if 'arxiv.org/abs/' in lp:
+        r.arxiv.add(narxiv(lp.split('/abs/')[-1]))
+    r.title = x.get('title')
+    r.authors = [a['author']['display_name'] for a in x.get('authorships', [])]
+    r.year = x.get('publication_year')
+    r.venue = (loc.get('source') or {}).get('display_name')
+    r.type = x.get('type')
+    r.published = r.type not in ('preprint',) and bool(r.dois)
+    return r
+
+
+def openalex(wid):
+    """The works citing OpenAlex work wid."""
+    p = {'mailto': MAILTO} if MAILTO else {}
     # page numbers, not cursors: without an API key OpenAlex answers a
     # next-page cursor with 401 (2026); plain paging reaches 10,000 works
     out, page = [], 1
@@ -339,25 +391,9 @@ def openalex(doi):
     while page:
         d = get('https://api.openalex.org/works',
                 dict(p, filter='cites:' + wid, page=page, select=sel, **{'per-page': 200}))
-        for x in d['results']:
-            r = Rec('A')
-            add_doi(r, x.get('doi'))
-            ids = x.get('ids') or {}
-            if ids.get('pmid'):
-                r.pmid.add(ids['pmid'].rsplit('/', 1)[-1])
-            loc = x.get('primary_location') or {}
-            lp = loc.get('landing_page_url') or ''
-            if 'arxiv.org/abs/' in lp:
-                r.arxiv.add(narxiv(lp.split('/abs/')[-1]))
-            r.title = x.get('title')
-            r.authors = [a['author']['display_name'] for a in x.get('authorships', [])]
-            r.year = x.get('publication_year')
-            r.venue = (loc.get('source') or {}).get('display_name')
-            r.type = x.get('type')
-            r.published = r.type not in ('preprint',) and bool(r.dois)
-            out.append(r)
+        out += [oa_rec(x) for x in d['results']]
         page = page + 1 if len(d['results']) == 200 and page < 50 else None
-    return out, wid
+    return out
 
 
 def opencitations(doi):
@@ -379,11 +415,12 @@ def opencitations(doi):
     return out
 
 
-def semanticscholar(doi, key=None):
+def semanticscholar(pid, key=None):
+    """Citations of a paper, pid = 'DOI:...' or 'ARXIV:...'."""
     h = {'x-api-key': key} if key else None
     out, offset = [], 0
     while offset is not None:
-        d = get('https://api.semanticscholar.org/graph/v1/paper/DOI:%s/citations' % doi,
+        d = get('https://api.semanticscholar.org/graph/v1/paper/%s/citations' % pid,
                 {'fields': 'contexts,title,year,externalIds,authors,venue',
                  'limit': 1000, 'offset': offset}, headers=h, tries=7, wait=10)
         if not d:
@@ -484,18 +521,20 @@ def enrich(recs):
 # --------------------------------------------------------------------------
 # --hunt: citations no index has linked
 # --------------------------------------------------------------------------
-def target_meta(doi):
-    m = crossref(doi) or {}
+def target_meta(seed):
+    doi = seed['doi'] if seed['doi'] and not seed['arxiv'] else None
+    m = (crossref(doi) if doi else None) or {}
     au = m.get('author') or [{}]
     dp = (m.get('issued') or {}).get('date-parts') or [[None]]
-    return {'doi': doi, 'nt': ntitle(' '.join(m.get('title') or [])),
+    title = ' '.join(m.get('title') or []) or seed['title'] or ''
+    return {'doi': doi, 'nt': ntitle(title),
             'volume': str(m.get('volume') or ''), 'page': str(m.get('page') or '').split('-')[0],
-            'year': str(dp[0][0] or ''), 'surname': ntitle(au[0].get('family', '')),
-            'count': m.get('is-referenced-by-count'), 'title': ' '.join(m.get('title') or [])}
+            'year': str(dp[0][0] or seed['year'] or ''), 'surname': ntitle(au[0].get('family', '')),
+            'count': m.get('is-referenced-by-count'), 'title': title}
 
 
 def cites_target(ref, t):
-    if ndoi(ref.get('DOI')) == t['doi']:
+    if t['doi'] and ndoi(ref.get('DOI')) == t['doi']:
         return True
     txt = ' '.join(str(ref.get(k, '')) for k in ('unstructured', 'article-title', 'journal-title', 'author'))
     if len(t['nt']) >= 20 and t['nt'][:30] in ntitle(txt):
@@ -571,27 +610,37 @@ def bib_entries(text):
         yield m.group(2), fields
 
 
+def entry_ids(f):
+    """The doi:/arxiv: identifiers a BibTeX entry's fields give."""
+    ids = []
+    for v in (f.get('doi'), f.get('url')):
+        if v and ('10.' in v):
+            d = ndoi(re.sub(r'^.*?(10\.\d{4,9}/)', r'\1', v))
+            a = arxiv_of_doi(d)
+            ids.append('arxiv:' + a if a else 'doi:' + d)
+    for v in (f.get('eprint'), f.get('journal'), f.get('url')):
+        m = re.search(r'(?:arXiv:|arxiv\.org/abs/)\s*([\w.\-/]+\d)', v or '', re.I)
+        if m:
+            ids.append('arxiv:' + narxiv(m.group(1)))
+    if (f.get('archiveprefix') or '').lower() == 'arxiv' and f.get('eprint'):
+        ids.append('arxiv:' + narxiv(f['eprint']))
+    return list(dict.fromkeys(ids))
+
+
 class Bib:
     def __init__(self, paths):
         self.by = {}
         self.authors = {}
+        self.fields = {}
         self.keys = set()
         self.titles = []    # (normalised title, key, year), for records with no id
         for p in paths:
             text = open(os.path.expanduser(p), encoding='utf-8', errors='replace').read()
             for key, f in bib_entries(text):
                 self.keys.add(key)
+                self.fields.setdefault(key, f)
                 self.authors[key] = f.get('author', '')
-                ids = []
-                for v in (f.get('doi'), f.get('url')):
-                    if v and ('10.' in v):
-                        d = ndoi(re.sub(r'^.*?(10\.\d{4,9}/)', r'\1', v))
-                        a = arxiv_of_doi(d)
-                        ids.append('arxiv:' + a if a else 'doi:' + d)
-                for v in (f.get('eprint'), f.get('journal'), f.get('url')):
-                    m = re.search(r'(?:arXiv:|arxiv\.org/abs/)\s*([\w.\-/]+\d)', v or '', re.I)
-                    if m:
-                        ids.append('arxiv:' + narxiv(m.group(1)))
+                ids = entry_ids(f)
                 nt = ntitle(f.get('title'))
                 if len(nt) >= 20:
                     ids.append('title:' + nt)
@@ -641,76 +690,238 @@ def wiki_text(api, title):
                   'titles': title, 'format': 'json', 'formatversion': 2})
     page = d['query']['pages'][0]
     if page.get('missing'):
-        sys.exit('citers: no page "%s" on %s' % (title, api))
+        sys.exit('citing: no page "%s" on %s' % (title, api))
     return page['revisions'][0]['slots']['main']['content']
 
 
 # --------------------------------------------------------------------------
-# Main
+# The paper: DOI, arXiv id, OpenAlex id or BibTeX key
 # --------------------------------------------------------------------------
-def parse_args(argv):
-    o = {'bib': [], 'known': None, 'wiki_page': None, 'wiki_api': os.environ.get('CITERS_WIKI_API'),
-         'own': [], 'since': None, 'missing': False, 'format': 'text', 'contexts': False,
-         'hunt': [], 'hunt_since': None, 'hunt_max': 300, 'mailto': os.environ.get('CITERS_MAILTO'),
-         's2_key': os.environ.get('S2_API_KEY'), 'quiet': False, 'doi': None}
-    takes = {'-b': 'bib', '--bib': 'bib', '-k': 'known', '--known': 'known', '-w': 'wiki_page',
-             '--wiki-page': 'wiki_page', '--wiki-api': 'wiki_api', '-o': 'own', '--own': 'own',
-             '-s': 'since', '--since': 'since', '-f': 'format', '--format': 'format',
-             '--hunt': 'hunt', '--hunt-since': 'hunt_since', '--hunt-max': 'hunt_max',
-             '--mailto': 'mailto', '--s2-key': 's2_key'}
-    flags = {'-m': 'missing', '--missing': 'missing', '--contexts': 'contexts', '-q': 'quiet', '--quiet': 'quiet'}
+ARXIV_ID = re.compile(r'^(?:arxiv:\s*|https?://arxiv\.org/abs/)?(\d{4}\.\d{4,5}|[a-z][a-z.\-]*(?:\.[a-z]{2})?/\d{7})(v\d+)?$', re.I)
+
+
+def oa_title_search(title, year=None, surname_=None):
+    """The OpenAlex work with this title (TeX allowed; and year, give or take
+    one), or None. OpenAlex's search drops a word whose accent is missing
+    ("Uber" for "Über"), so the search is retried with the first author's
+    surname and without the accented words."""
+    p = {'mailto': MAILTO} if MAILTO else {}
+
+    def clean(t):
+        t = re.sub(r'[^\w\s-]', ' ', strip_accents(re.sub(r'\$|\\[a-zA-Z]+', '', detex(t))))
+        return ' '.join(t.split())
+
+    plain = ' '.join(w for w in (title or '').split() if '\\' not in w and w.isascii())
+    tries = [(clean(title), None)]
+    if surname_:
+        tries.append((clean(title), clean(surname_)))
+    if plain != title and len(clean(plain).split()) >= 3:
+        tries.append((clean(plain), clean(surname_) if surname_ else None))
+    nt = ntitle(title)
+    for q, who in tries:
+        if not q:
+            continue
+        flt = 'title.search:' + q + (',raw_author_name.search:' + who if who else '')
+        d = get('https://api.openalex.org/works',
+                dict(p, filter=flt, select='id,doi,title,publication_year,authorships',
+                     **{'per-page': 25})) or {'results': []}
+        best, score = None, 0.0
+        for x in d['results']:
+            sc = similar(nt, ntitle(x.get('title')))
+            if year and x.get('publication_year') and abs(x['publication_year'] - year) > 1:
+                sc -= 0.2
+            if surname_ and sc >= 0.9:
+                names = ' '.join(ntitle(a['author']['display_name']) for a in x.get('authorships', []))
+                if ntitle(surname_) not in names:
+                    sc -= 0.05
+            if sc > score:
+                best, score = x, sc
+        if score >= 0.9:
+            return best
+    return None
+
+
+def resolve(arg, bib=None, prog='citing'):
+    """What the command line names -> {doi, arxiv, wid, key, title, year}.
+    A BibTeX key is looked up in bib; a key whose entry has neither DOI nor
+    arXiv id is found in OpenAlex by title."""
+    s = {'doi': None, 'arxiv': None, 'wid': None, 'key': None, 'title': None, 'year': None}
+    a = arg.strip()
+    m = re.match(r'^(?:https?://openalex\.org/)?(W\d{4,})$', a, re.I)
+    if m:
+        s['wid'] = m.group(1).upper()
+        return s
+    if re.match(r'^(?:(?:https?://)?(?:dx\.)?doi\.org/|doi:\s*)?10\.\d{4,9}/\S+$', a, re.I):
+        s['doi'] = ndoi(a)
+        s['arxiv'] = arxiv_of_doi(s['doi'])
+        if bib:
+            r = Rec()
+            add_doi(r, s['doi'])
+            s['key'] = (bib.match(r) or [None])[0]
+        return s
+    m = ARXIV_ID.match(a)
+    if m:
+        s['arxiv'] = narxiv(m.group(1))
+        s['doi'] = '10.48550/arxiv.' + s['arxiv'].lower()
+        if bib:
+            r = Rec()
+            r.arxiv.add(s['arxiv'])
+            s['key'] = (bib.match(r) or [None])[0]
+        return s
+    # a BibTeX key
+    if not bib:
+        sys.exit('%s: "%s" is no DOI, arXiv or OpenAlex id; a BibTeX key needs --bib (or a ~/.%src)'
+                 % (prog, a, prog))
+    key = a if a in bib.fields else next((k for k in bib.fields if k.lower() == a.lower()), None)
+    if key is None:
+        import difflib
+        near = difflib.get_close_matches(a, list(bib.fields), n=5, cutoff=0.75)
+        sys.exit('%s: no key "%s" in the bib files%s' % (prog, a, ' (close: %s)' % ', '.join(near) if near else ''))
+    f = bib.fields[key]
+    s['key'], s['title'] = key, detex(f.get('title', '')).strip() or None
+    y = re.search(r'\d{4}', f.get('year', ''))
+    s['year'] = int(y.group(0)) if y else None
+    ids = entry_ids(f)
+    dois = [i[4:] for i in ids if i.startswith('doi:')]
+    axs = [i[6:] for i in ids if i.startswith('arxiv:')]
+    if dois:
+        s['doi'] = dois[0]
+    elif axs:
+        s['arxiv'] = axs[0]
+        s['doi'] = '10.48550/arxiv.' + axs[0].lower()
+    elif s['title']:
+        names = re.split(r'\s+and\s+', f.get('author', ''))
+        x = oa_title_search(f.get('title'), s['year'], surname(names[0]) if names[0] else None)
+        if not x:
+            sys.exit('%s: %s has no DOI or arXiv id, and OpenAlex has no work titled "%s"'
+                     % (prog, key, s['title']))
+        s['wid'] = x['id'].rsplit('/', 1)[-1]
+        if x.get('doi'):
+            s['doi'] = ndoi(x['doi'])
+            s['arxiv'] = arxiv_of_doi(s['doi'])
+        say('  %s has no DOI in the bib; OpenAlex %s by title%s' % (key, s['wid'], ': ' + s['doi'] if s['doi'] else ''))
+    else:
+        sys.exit('%s: %s has no DOI, arXiv id or title' % (prog, key))
+    return s
+
+
+def label(seed):
+    if seed['key']:
+        return seed['key']
+    if seed['arxiv']:
+        return 'arXiv:' + seed['arxiv']
+    return seed['doi'] or seed['wid']
+
+
+# --------------------------------------------------------------------------
+# Options and defaults
+# --------------------------------------------------------------------------
+def read_rc(env, name):
+    """The options written in ~/.<name>rc (or the file env names), as tokens."""
+    import shlex
+    path = os.environ.get(env) or os.path.expanduser('~/.%src' % name)
+    try:
+        text = open(path, encoding='utf-8').read()
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        out += shlex.split(line, comments=True)
+    return out
+
+
+def parse_options(argv, o, takes, flags, lists, ints, prog, positional, given=None):
+    """Read argv into o. lists: options that may repeat (comma-separated values
+    are split, except for 'raw' ones); ints: options holding a number.
+    Returns the set of options given."""
+    given = set() if given is None else given
+    seen_lists = set()
     i = 0
+    argv = list(argv)
     while i < len(argv):
         a = argv[i]
-        if a in ('-h', '--help'):
-            print(__doc__.strip())
-            sys.exit(0)
-        if a in ('-V', '--version'):
-            print('citers', __version__)
-            sys.exit(0)
         if '=' in a and a.split('=', 1)[0] in takes:
             a, val = a.split('=', 1)
             argv[i:i + 1] = [a, val]
         if a in takes:
             if i + 1 >= len(argv):
-                sys.exit('citers: %s needs a value' % a)
+                sys.exit('%s: %s needs a value' % (prog, a))
             k, v = takes[a], argv[i + 1]
-            if k == 'bib':
-                o['bib'] += [x for x in v.split(',') if x]
-            elif k == 'own':
-                o['own'] += [x.strip() for x in v.split(',') if x.strip()]
-            elif k == 'hunt':
-                o['hunt'].append(v)
-            elif k in ('since', 'hunt_since', 'hunt_max'):
-                o[k] = int(v)
+            if k in lists:
+                if k not in seen_lists:          # the first use replaces the default
+                    o[k], seen_lists = [], seen_lists | {k}
+                o[k] += [v] if lists[k] == 'raw' else [x.strip() for x in v.split(',') if x.strip()]
+            elif k in ints:
+                try:
+                    o[k] = int(v)
+                except ValueError:
+                    sys.exit('%s: %s takes a number' % (prog, a))
             else:
                 o[k] = v
+            given.add(k)
             i += 2
             continue
         if a in flags:
             o[flags[a]] = True
+            given.add(flags[a])
         elif a.startswith('-') and a != '-':
-            sys.exit('citers: unknown option %s (citers -h)' % a)
-        elif o['doi'] is None:
-            o['doi'] = a
+            sys.exit('%s: unknown option %s (%s -h)' % (prog, a, prog))
+        elif positional is None:
+            sys.exit('%s: no argument expected here: %s' % (prog, a))
         else:
-            sys.exit('citers: one DOI at a time')
+            positional.append(a)
         i += 1
-    if not o['doi']:
+    return given
+
+
+TAKES = {'-b': 'bib', '--bib': 'bib', '-k': 'known', '--known': 'known', '-w': 'wiki_page',
+         '--wiki-page': 'wiki_page', '--wiki-api': 'wiki_api', '-o': 'own', '--own': 'own',
+         '-s': 'since', '--since': 'since', '-f': 'format', '--format': 'format',
+         '--hunt': 'hunt', '--hunt-since': 'hunt_since', '--hunt-max': 'hunt_max',
+         '--mailto': 'mailto', '--s2-key': 's2_key', '--openalex-key': 'openalex_key'}
+FLAGS = {'-m': 'missing', '--missing': 'missing', '--contexts': 'contexts', '-q': 'quiet', '--quiet': 'quiet'}
+
+
+def parse_args(argv):
+    o = {'bib': [], 'known': None, 'wiki_page': None, 'wiki_api': os.environ.get('CITING_WIKI_API'),
+         'own': [], 'since': None, 'missing': False, 'format': 'text', 'contexts': False,
+         'hunt': [], 'hunt_since': None, 'hunt_max': 300, 'mailto': os.environ.get('CITING_MAILTO'),
+         's2_key': os.environ.get('S2_API_KEY'), 'openalex_key': os.environ.get('OPENALEX_API_KEY'),
+         'quiet': False}
+    for a in argv:
+        if a in ('-h', '--help'):
+            print(__doc__.strip())
+            sys.exit(0)
+        if a in ('-V', '--version'):
+            print('citing', __version__)
+            sys.exit(0)
+    lists = {'bib': 'split', 'own': 'split', 'hunt': 'raw'}
+    ints = ('since', 'hunt_since', 'hunt_max')
+    pos = []
+    given = parse_options(argv, o, TAKES, FLAGS, lists, ints, 'citing', pos)
+    rc = dict(o)
+    for k in lists:
+        rc[k] = []
+    rc_given = parse_options(read_rc('CITING_RC', 'citing'), rc, TAKES, FLAGS, lists, ints, 'citing (~/.citingrc)', None)
+    for k in rc_given - given:
+        o[k] = rc[k]
+    if not pos:
         print(__doc__.strip())
         sys.exit(1)
+    if len(pos) > 1:
+        sys.exit('citing: one paper at a time')
+    o['paper'] = pos[0]
     if o['format'] not in ('text', 'csv', 'json', 'keys', 'ids'):
-        sys.exit('citers: --format is text, csv, json, keys or ids')
+        sys.exit('citing: --format is text, csv, json, keys or ids')
     if o['wiki_page'] and not o['wiki_api']:
-        sys.exit('citers: --wiki-page needs --wiki-api (or env CITERS_WIKI_API)')
+        sys.exit('citing: --wiki-page needs --wiki-api (or env CITING_WIKI_API)')
     return o
 
 
 def main(argv):
-    global QUIET, MAILTO
+    global QUIET, MAILTO, OPENALEX_KEY
     o = parse_args(argv)
-    QUIET, MAILTO = o['quiet'], o['mailto']
-    doi = ndoi(o['doi'])
+    QUIET, MAILTO, OPENALEX_KEY = o['quiet'], o['mailto'], o['openalex_key']
 
     bib = Bib(o['bib']) if o['bib'] else None
     known = None
@@ -720,18 +931,30 @@ def main(argv):
         txt = sys.stdin.read() if o['known'] == '-' else open(os.path.expanduser(o['known']), encoding='utf-8', errors='replace').read()
         known = known_keys(txt, bib)
 
-    say('citers %s: works citing %s' % (__version__, doi))
-    oa, wid = openalex(doi)
-    say('  OpenAlex: %d%s' % (len(oa), '' if wid else ' (DOI unknown to OpenAlex)'))
-    oc = opencitations(doi)
+    seed = resolve(o['paper'], bib)
+    if not seed['wid'] and seed['doi']:
+        w = openalex_work('doi:' + seed['doi'])
+        if w:
+            seed['wid'] = w['id'].rsplit('/', 1)[-1]
+            seed['title'] = seed['title'] or w.get('title')
+            seed['year'] = seed['year'] or w.get('publication_year')
+    ids = ' '.join(x for x in (seed['doi'] and 'doi:' + seed['doi'], seed['arxiv'] and 'arXiv:' + seed['arxiv'],
+                               seed['wid']) if x and x != label(seed))
+    say('citing %s: works citing %s%s' % (__version__, label(seed), ' (%s)' % ids if ids else ''))
+    oa = openalex(seed['wid']) if seed['wid'] else []
+    say('  OpenAlex: %d%s' % (len(oa), '' if seed['wid'] else ' (paper unknown to OpenAlex)'))
+    plain_doi = seed['doi'] if seed['doi'] and not seed['arxiv'] else None
+    oc = opencitations(plain_doi or seed['doi']) if seed['doi'] else []
     say('  OpenCitations: %d' % len(oc))
-    s2 = semanticscholar(doi, o['s2_key'])
+    s2id = 'DOI:' + plain_doi if plain_doi else ('ARXIV:' + seed['arxiv'] if seed['arxiv'] else None)
+    s2 = semanticscholar(s2id, o['s2_key']) if s2id else []
     say('  Semantic Scholar: %d' % len(s2))
-    t = target_meta(doi)
+    t = target_meta(seed)
     recs = enrich(oa + oc + s2)
     works = fuzzy_join(merge_all(recs))
     # the paper itself can come back through a preprint alias; drop it
-    works = [w for w in works if doi not in w.dois]
+    works = [w for w in works if not (seed['doi'] and seed['doi'] in w.dois)
+             and not (seed['arxiv'] and seed['arxiv'] in w.arxiv)]
 
     if o['hunt']:
         listed = {d for w in works for d in w.dois}
